@@ -377,7 +377,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             if self.config.kernel_version != "6.6":
                 f.write("CONFIG_KSU_SUSFS_SUS_PATH=y\n")
             else:
-                f.write("CONFIG_KSU_SUSFS_SUS_PATH=n\n")
+                f.write("CONFIG_KSU_SUSFS_SUS_PATH=y\n")
 
         if self.config.use_zram:
             self._configure_zram()
