@@ -257,6 +257,164 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 self._chdir(ksu_dir)
                 self._run_cmd(f"git checkout {self.config.kernelsu_commit}", check=False)
                 self._chdir(self.work_dir)
+        self.apply_safemode_fix()
+
+    def apply_safemode_fix(self):
+        """Prevent late safemode false-positives after normal boot.
+
+        SukiSU counts KEY_VOLUMEDOWN for safemode. If the input kprobe is not
+        fully unregistered, later volume presses can flip safemode=true while
+        modules already loaded. Decide safemode only once during early boot.
+        """
+        logger.info("=== 应用 safemode 误报修复 ===")
+        ksu_root = self.work_dir / "KernelSU" / "kernel"
+        candidates = [
+            ksu_root / "runtime" / "ksud_integration.c",
+            ksu_root / "ksud.c",
+            self.work_dir / "common" / "drivers" / "kernelsu" / "runtime" / "ksud_integration.c",
+            self.work_dir / "common" / "drivers" / "kernelsu" / "ksud.c",
+        ]
+        target = next((p for p in candidates if p.exists() and p.is_file()), None)
+        if not target:
+            # Follow symlink targets as well
+            for p in candidates:
+                try:
+                    resolved = p.resolve()
+                except OSError:
+                    continue
+                if resolved.exists() and resolved.is_file():
+                    target = resolved
+                    break
+        if not target:
+            logger.warning("未找到 ksud_integration.c/ksud.c，跳过 safemode 修复")
+            return
+
+        original = target.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n")
+        if "static bool decided = false;" in original:
+            logger.info(f"safemode 修复已存在: {target}")
+            return
+
+        content = original
+        has_boot_flags = ("ksu_module_mounted" in content) or ("ksu_boot_completed" in content)
+        # New SukiSU layout exposes these via ksud_boot.h
+        if "runtime/ksud_boot.h" in content:
+            has_boot_flags = True
+
+        # 1) Stop counting volume keys after boot/modules are up (new layout)
+        if has_boot_flags and "ksu_handle_input_handle_event" in content:
+            handler_old = (
+                "int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value)\n"
+                "{\n"
+                "    if (*type == EV_KEY && *code == KEY_VOLUMEDOWN) {"
+            )
+            handler_new = (
+                "int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value)\n"
+                "{\n"
+                "    /* Boot finished: never keep counting volume keys for safemode. */\n"
+                "    if (ksu_module_mounted || ksu_boot_completed)\n"
+                "        return 0;\n"
+                "\n"
+                "    if (*type == EV_KEY && *code == KEY_VOLUMEDOWN) {"
+            )
+            if handler_old in content:
+                content = content.replace(handler_old, handler_new, 1)
+
+        # 2) Decide safemode only once
+        if has_boot_flags:
+            once_guard = (
+                "    if (decided || ksu_module_mounted || ksu_boot_completed)\n"
+                "        return false;\n"
+                "\n"
+                "    decided = true;\n"
+            )
+        else:
+            once_guard = (
+                "    if (decided)\n"
+                "        return false;\n"
+                "\n"
+                "    decided = true;\n"
+            )
+
+        old_safe = (
+            "bool ksu_is_safe_mode()\n"
+            "{\n"
+            "    static bool safe_mode = false;\n"
+            "    if (safe_mode) {\n"
+            "        // don't need to check again, userspace may call multiple times\n"
+            "        return true;\n"
+            "    }\n"
+            "\n"
+            "    if (ksu_late_loaded) {\n"
+            "        return false;\n"
+            "    }\n"
+            "\n"
+            "    // stop hook first!\n"
+        )
+        new_safe = (
+            "bool ksu_is_safe_mode()\n"
+            "{\n"
+            "    static bool safe_mode = false;\n"
+            "    static bool decided = false;\n"
+            "    if (safe_mode) {\n"
+            "        // don't need to check again, userspace may call multiple times\n"
+            "        return true;\n"
+            "    }\n"
+            "\n"
+            "    if (ksu_late_loaded) {\n"
+            "        return false;\n"
+            "    }\n"
+            "\n"
+            "    /*\n"
+            "     * Safemode may only be decided once during early boot.\n"
+            "     * Later manager queries must not flip into safemode just because\n"
+            "     * volume-down was pressed while the input hook was still alive.\n"
+            "     */\n"
+            f"{once_guard}\n"
+            "    // stop hook first!\n"
+        )
+        if old_safe in content:
+            content = content.replace(old_safe, new_safe, 1)
+        else:
+            # Fallback for minor whitespace / void prototype differences
+            pattern = re.compile(
+                r"bool\s+ksu_is_safe_mode\s*\(\s*(?:void)?\s*\)\s*\{"
+                r"\s*static\s+bool\s+safe_mode\s*=\s*false\s*;",
+                re.MULTILINE,
+            )
+            match = pattern.search(content)
+            if not match:
+                logger.error(f"无法匹配 ksu_is_safe_mode，跳过修复: {target}")
+                return
+            insert_at = match.end()
+            content = (
+                content[:insert_at]
+                + "\n    static bool decided = false;"
+                + content[insert_at:]
+            )
+            if "decided = true" not in content:
+                guard = (
+                    "    if (ksu_late_loaded) {\n"
+                    "        return false;\n"
+                    "    }\n"
+                )
+                if guard in content:
+                    content = content.replace(guard, guard + "\n" + once_guard, 1)
+                else:
+                    for stop_line in (
+                        "    // stop hook first!\n",
+                        "    stop_input_hook();\n",
+                        "    ksu_stop_input_hook_runtime();\n",
+                    ):
+                        if stop_line in content:
+                            content = content.replace(stop_line, once_guard + "\n" + stop_line, 1)
+                            break
+
+        if content == original:
+            logger.error(f"safemode 修复未产生变更: {target}")
+            return
+
+        target.write_text(content, encoding="utf-8", newline="\n")
+        logger.info(f"已写入 safemode 修复: {target}")
 
     def add_bbg(self):
         if not self.config.use_bbg:
